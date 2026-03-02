@@ -87,9 +87,9 @@ Below is a concise list of available routes. See detailed sections further down 
 
 **Core Endpoints:**
 - GET `/` — Server info and endpoint hints
-- GET `/player?rtsp_url=...` — Browser player (HLS)
+- GET `/player?rtsp_url=...&speed=<0.5-4.0>` — Browser player (HLS) with fast-forward support
 - GET `/stream?rtsp_url=...` — Direct MPEG-TS stream from RTSP URL
-- GET `/stream/hls?rtsp_url=...` — Direct HLS playlist from RTSP URL
+- GET `/stream/hls?rtsp_url=...&speed=<0.5-4.0>` — Direct HLS playlist from RTSP URL with speed control
 
 **Managed Streams:**
 - POST `/api/stream/{id}/start?rtsp_url=...` — Start managed stream
@@ -135,15 +135,27 @@ ffplay "http://localhost:5000/stream?rtsp_url=rtsp://admin:admin@192.168.1.100:5
 
 #### 3. Browser Player
 ```bash
-GET /player?rtsp_url=<encoded_rtsp_url>
+GET /player?rtsp_url=<encoded_rtsp_url>&speed=<optional_speed>
 ```
 
-Opens a web page with HLS player for browser viewing.
+Opens a web page with HLS player for browser viewing. Supports fast-forward and slow-motion playback.
 
-Example:
+Parameters:
+- `rtsp_url` (required): URL-encoded RTSP stream URL
+- `speed` (optional): Playback speed multiplier (default: 1.0)
+  - Range: 0.5 (half speed) to 4.0 (4x speed)
+  - Values ≥ 2.0 will drop audio for faster processing
+
+Examples:
 ```bash
-# Open in browser
+# Normal speed
 http://localhost:5000/player?rtsp_url=rtsp://username:password@192.168.1.100:554/stream
+
+# 2x fast-forward (no audio)
+http://localhost:5000/player?rtsp_url=rtsp://username:password@192.168.1.100:554/stream&speed=2.0
+
+# Half speed (slow motion)
+http://localhost:5000/player?rtsp_url=rtsp://username:password@192.168.1.100:554/stream&speed=0.5
 ```
 
 #### 4. Start a Managed Stream
@@ -200,16 +212,32 @@ Example:
 vlc http://localhost:5000/stream/camera1/hls/playlist.m3u8
 ```
 
-#### 9. Direct HLS Stream
+#### 9. Direct HLS Stream with Speed Control
 ```bash
-GET /stream/hls?rtsp_url=<encoded_rtsp_url>
+GET /stream/hls?rtsp_url=<encoded_rtsp_url>&speed=<optional_speed>
 ```
 
-Get HLS playlist directly without managing a stream.
+Get HLS playlist directly without managing a stream. Supports fast-forward and slow-motion playback.
 
-Example:
+Parameters:
+- `rtsp_url` (required): URL-encoded RTSP stream URL
+- `speed` (optional): Playback speed multiplier (default: 1.0, range: 0.5-4.0)
+
+**Performance Note:** Speeds ≥ 2.0 automatically drop audio for faster processing.
+
+Examples:
 ```bash
+# Normal speed
 curl "http://localhost:5000/stream/hls?rtsp_url=rtsp://admin:pass@192.168.1.100:554/stream"
+
+# 2x fast-forward (optimized, no audio)
+curl "http://localhost:5000/stream/hls?rtsp_url=rtsp://admin:pass@192.168.1.100:554/stream&speed=2.0"
+
+# 4x fast-forward (maximum, no audio)
+curl "http://localhost:5000/stream/hls?rtsp_url=rtsp://admin:pass@192.168.1.100:554/stream&speed=4.0"
+
+# 1.5x with audio
+curl "http://localhost:5000/stream/hls?rtsp_url=rtsp://admin:pass@192.168.1.100:554/stream&speed=1.5"
 ```
 
 #### 10. List Active HLS Sessions
@@ -368,7 +396,11 @@ cargo run --release
 
 2. Open in your browser:
 ```
+# Normal playback
 http://localhost:5000/player?rtsp_url=rtsp://admin:admin123@192.168.1.50:554/stream1
+
+# 2x fast-forward (useful for reviewing recordings)
+http://localhost:5000/player?rtsp_url=rtsp://admin:admin123@192.168.1.50:554/stream1&speed=2.0
 ```
 
 Or view directly in VLC:
@@ -431,31 +463,59 @@ curl "http://localhost:5000/proxyhl/sessions"
 
 ## HTML Client Examples
 
-### Simple Direct Stream Player
+### Simple Direct Stream Player with Speed Control
 
 ```html
 <!DOCTYPE html>
 <html>
 <head>
     <title>RTSP Direct Player</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        input[type="text"] { width: 500px; padding: 8px; }
+        button { padding: 8px 16px; margin: 5px; }
+        .speed-controls { margin-top: 10px; }
+    </style>
 </head>
 <body>
     <h1>RTSP Direct Stream Player</h1>
     
     <div>
-        <input type="text" id="rtspUrl" placeholder="RTSP URL" value="rtsp://192.168.1.100/stream" style="width: 500px;">
-        <button onclick="playStream()">Play Stream</button>
+        <input type="text" id="rtspUrl" placeholder="RTSP URL" value="rtsp://192.168.1.100/stream">
     </div>
     
-    <div id="playerContainer"></div>
+    <div class="speed-controls">
+        <label>Playback Speed:</label>
+        <button onclick="playStream(0.5)">0.5x</button>
+        <button onclick="playStream(1.0)">1.0x (Normal)</button>
+        <button onclick="playStream(1.5)">1.5x</button>
+        <button onclick="playStream(2.0)">2.0x</button>
+        <button onclick="playStream(3.0)">3.0x</button>
+        <button onclick="playStream(4.0)">4.0x</button>
+    </div>
+    
+    <div id="info" style="margin-top: 10px; color: #666; font-size: 14px;"></div>
 
     <script>
-        function playStream() {
+        function playStream(speed = 1.0) {
             const rtspUrl = document.getElementById('rtspUrl').value;
             const encodedUrl = encodeURIComponent(rtspUrl);
             
-            // Use built-in player page
-            window.location.href = `http://localhost:5000/player?rtsp_url=${encodedUrl}`;
+            // Show info about audio
+            const info = document.getElementById('info');
+            if (speed >= 2.0) {
+                info.textContent = `⚡ Fast-forward mode: Audio will be dropped for performance`;
+                info.style.color = '#ff9800';
+            } else {
+                info.textContent = '';
+            }
+            
+            // Use built-in player page with speed parameter
+            let url = `http://localhost:5000/player?rtsp_url=${encodedUrl}`;
+            if (speed !== 1.0) {
+                url += `&speed=${speed}`;
+            }
+            window.location.href = url;
         }
     </script>
 </body>
@@ -522,7 +582,51 @@ curl "http://localhost:5000/proxyhl/sessions"
 
 For a complete web interface, see [viewer.html](viewer.html) included in the repository.
 
+## Fast-Forward / Speed Control
+
+The `/stream/hls` and `/player` endpoints support speed control for fast-forwarding through recordings or slow-motion playback.
+
+### How It Works
+
+- **Speed Range**: 0.5x (half speed) to 4.0x (4x speed)
+- **Video**: Uses FFmpeg's `setpts` filter to adjust playback speed
+- **Audio**:
+  - Speeds < 2.0: Audio tempo is adjusted using `atempo` filter
+  - Speeds ≥ 2.0: Audio is **dropped entirely** for performance
+
+### Performance Optimizations
+
+For fast-forward modes (≥ 2x):
+- Audio is automatically disabled to reduce processing time
+- Lower video bitrate (1000k vs 2000k)
+- Multi-threaded encoding enabled
+- Optimized H.264 baseline profile
+- Faster input reading with `-readrate` flag
+
+### Use Cases
+
+**Security Camera Playback Review** (2x-4x speed):
+```bash
+# Review 1 hour of footage in 15 minutes at 4x speed
+http://localhost:5000/player?rtsp_url=rtsp://camera/playback/2025-01-15T10:00:00&speed=4.0
+```
+
+**Slow Motion Analysis** (0.5x speed):
+```bash
+# Analyze movement at half speed
+http://localhost:5000/player?rtsp_url=rtsp://camera/live&speed=0.5
+```
+
+**Normal with Speed Toggle** (1.0x-2.0x):
+The built-in player includes speed control buttons (0.5x, 1.0x, 1.5x, 2.0x, 3.0x, 4.0x) for easy switching.
+
 ## Troubleshooting
+
+### Slow Fast-Forward Performance
+- Ensure FFmpeg is using hardware acceleration if available
+- Lower bitrate in `streaming_server.rs` if needed
+- Use speeds ≥ 2.0 to automatically drop audio (significantly faster)
+- Check CPU usage - video transcoding is CPU-intensive
 
 ### FFmpeg Not Found
 If you get errors about FFmpeg not being found:
