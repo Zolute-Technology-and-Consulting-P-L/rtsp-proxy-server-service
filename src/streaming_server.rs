@@ -159,9 +159,9 @@ async fn root_handler() -> impl IntoResponse {
         "name": "RTSP Proxy Server",
         "version": "0.1.0",
         "endpoints": {
-            "player": "GET /player?rtsp_url=<url> - Play HLS stream in browser",
+            "player": "GET /player?rtsp_url=<url>&speed=<1.0-4.0> - Play HLS stream in browser with speed control",
             "direct_stream": "GET /stream?rtsp_url=<url> - Stream directly from RTSP URL (for VLC/ffplay)",
-            "hls_stream": "GET /stream/hls?rtsp_url=<url> - Create HLS session from RTSP URL",
+            "hls_stream": "GET /stream/hls?rtsp_url=<url>&speed=<0.5-4.0> - Create HLS session from RTSP URL with fast-forward support",
             "hls_playlist": "GET /stream/hls/{id}/playlist.m3u8 - Get HLS playlist for session",
             "hls_segment": "GET /stream/hls/{id}/{file} - Get HLS segment",
             "api_streams": "GET /api/streams - List all managed streams",
@@ -178,8 +178,10 @@ async fn root_handler() -> impl IntoResponse {
         },
         "examples": {
             "browser_hls": "http://localhost:8080/player?rtsp_url=rtsp://user:pass@camera-ip:554/stream",
+            "browser_hls_2x": "http://localhost:8080/player?rtsp_url=rtsp://user:pass@camera-ip:554/stream&speed=2.0",
             "vlc_direct": "vlc http://localhost:8080/stream?rtsp_url=rtsp://user:pass@camera-ip:554/stream",
             "hls_generic": "http://localhost:8080/stream/hls?rtsp_url=rtsp://user:pass@camera-ip:554/stream",
+            "hls_fastforward": "http://localhost:8080/stream/hls?rtsp_url=rtsp://user:pass@camera-ip:554/stream&speed=2.0",
             "hikvision": "http://localhost:8080/proxyhl/rtsp?ip=192.168.1.100&channel=1"
         }
     }))
@@ -379,6 +381,8 @@ async fn stream_hls_segment(
 #[derive(Deserialize)]
 struct DirectStreamQuery {
     rtsp_url: String,
+    #[serde(default)]
+    speed: Option<f32>,
 }
 
 async fn direct_stream(
@@ -387,6 +391,20 @@ async fn direct_stream(
     use std::process::Stdio;
     use tokio::process::Command;
     use tokio::io::AsyncReadExt;
+    
+    // Validate RTSP URL format
+    if !params.rtsp_url.starts_with("rtsp://") && !params.rtsp_url.starts_with("rtsps://") {
+        error!("Invalid RTSP URL format: {}", params.rtsp_url);
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Invalid RTSP URL: '{}'. URL must start with 'rtsp://' or 'rtsps://'. \
+                 Make sure to properly URL-encode the rtsp_url parameter.",
+                params.rtsp_url
+            ),
+        )
+            .into_response();
+    }
     
     info!("Direct stream requested for {}", params.rtsp_url);
 
@@ -461,7 +479,27 @@ async fn direct_stream(
 }
 
 async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response {
-    info!("Direct HLS stream requested for {}", params.rtsp_url);
+    let speed = params.speed.unwrap_or(1.0).max(0.5).min(4.0); // Clamp between 0.5x and 4x
+    
+    // Validate RTSP URL format
+    if !params.rtsp_url.starts_with("rtsp://") && !params.rtsp_url.starts_with("rtsps://") {
+        error!("Invalid RTSP URL format: {}", params.rtsp_url);
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Invalid RTSP URL: '{}'. URL must start with 'rtsp://' or 'rtsps://'. \
+                 Make sure to properly URL-encode the rtsp_url parameter. \
+                 Example: /stream/hls?rtsp_url=rtsp%3A%2F%2Fuser%3Apass%40camera%3A554%2Fstream&speed=2.0",
+                params.rtsp_url
+            ),
+        )
+            .into_response();
+    }
+    
+    info!("Direct HLS stream requested for {} at {}x speed", params.rtsp_url, speed);
+    if speed >= 2.0 {
+        info!("Fast-forward mode: audio will be dropped for faster processing");
+    }
 
     // Create a temporary directory for HLS segments
     let id = Uuid::new_v4().to_string();
@@ -502,28 +540,76 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
     let tmp_dir_for_ffmpeg = tmp_dir.clone();
     let sessions_for_ffmpeg = HLS_SESSIONS.clone();
     tokio::spawn(async move {
+        // Build FFmpeg args with speed control optimizations
+        let mut ffmpeg_args: Vec<String> = vec![
+            "-rtsp_transport".to_string(), "tcp".to_string(),
+        ];
+
+        // For speeds > 1.0, read input faster (helps with recorded streams)
+        if speed > 1.0 {
+            ffmpeg_args.extend_from_slice(&[
+                "-readrate".to_string(), speed.to_string(),
+            ]);
+        }
+
+        ffmpeg_args.extend_from_slice(&[
+            "-i".to_string(), rtsp_url_clone.clone(),
+        ]);
+
+        // Add video filter for speed control
+        if (speed - 1.0).abs() > 0.01 {
+            let video_filter = format!("setpts=PTS/{}", speed);
+            ffmpeg_args.extend_from_slice(&[
+                "-vf".to_string(), video_filter,
+            ]);
+
+            // For fast-forward, drop audio or use simple tempo
+            if speed >= 2.0 {
+                // Drop audio for speeds >= 2x (much faster processing)
+                ffmpeg_args.extend_from_slice(&[
+                    "-an".to_string(),
+                ]);
+            } else {
+                // Audio tempo filter for moderate speeds
+                let audio_filter = format!("atempo={}", speed);
+                ffmpeg_args.extend_from_slice(&[
+                    "-af".to_string(), audio_filter,
+                ]);
+            }
+        }
+
+        // Add HLS output settings with optimizations
+        ffmpeg_args.extend_from_slice(&[
+            "-f".to_string(), "hls".to_string(),
+            "-hls_time".to_string(), "2".to_string(),
+            "-hls_list_size".to_string(), "5".to_string(),
+            "-hls_flags".to_string(), "delete_segments+independent_segments".to_string(),
+            "-hls_segment_filename".to_string(), segment_pattern.clone(),
+            "-hls_base_url".to_string(), base_url.clone(),
+            "-codec:v".to_string(), "libx264".to_string(),
+            "-preset".to_string(), "veryfast".to_string(), // Faster than ultrafast for speed processing
+            "-tune".to_string(), "zerolatency".to_string(),
+            "-profile:v".to_string(), "baseline".to_string(), // Simpler profile, faster encoding
+            "-g".to_string(), "50".to_string(),
+            "-keyint_min".to_string(), "25".to_string(),
+            "-sc_threshold".to_string(), "0".to_string(),
+            "-b:v".to_string(), "1000k".to_string(), // Lower bitrate for faster encoding
+            "-threads".to_string(), "0".to_string(), // Use all CPU threads
+        ]);
+
+        // Only add audio codec if we're not dropping audio
+        if speed < 2.0 {
+            ffmpeg_args.extend_from_slice(&[
+                "-codec:a".to_string(), "aac".to_string(),
+                "-ar".to_string(), "44100".to_string(),
+                "-b:a".to_string(), "96k".to_string(), // Lower audio bitrate
+            ]);
+        }
+
+        ffmpeg_args.push(playlist_path_clone.clone());
+
         let mut child = match Command::new("ffmpeg")
-            .args(&[
-                "-rtsp_transport", "tcp",
-                "-i", &rtsp_url_clone,
-                "-f", "hls",
-                "-hls_time", "2",
-                "-hls_list_size", "5",
-                "-hls_flags", "delete_segments+independent_segments",
-                "-hls_segment_filename", &segment_pattern,
-                "-hls_base_url", &base_url,
-                "-codec:v", "libx264",
-                "-preset", "ultrafast",
-                "-tune", "zerolatency",
-                "-g", "50",
-                "-keyint_min", "25",
-                "-sc_threshold", "0",
-                "-b:v", "2000k",
-                "-codec:a", "aac",
-                "-ar", "44100",
-                "-b:a", "128k",
-                &playlist_path_clone,
-            ])
+            .args(&ffmpeg_args)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
@@ -580,10 +666,10 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
         }
     });
 
-    // Poll for playlist existence (up to ~20s), then redirect to it
+    // Poll for playlist existence (up to ~10s for faster startup), then redirect to it
     let playlist_rel_url = format!("/stream/hls/{}/playlist.m3u8", id);
     let mut ready = false;
-    for _ in 0..80 {
+    for _ in 0..40 {  // Reduced from 80 to 40 (10 seconds instead of 20)
         if let Ok(meta) = std::fs::metadata(&playlist_path) {
             if meta.len() > 0 {
                 ready = true;
@@ -1180,7 +1266,42 @@ async fn list_proxyhl_sessions() -> impl IntoResponse {
 }
 
 async fn player_page(Query(params): Query<DirectStreamQuery>) -> Response {
-    let hls_url = format!("/stream/hls?rtsp_url={}", urlencoding::encode(&params.rtsp_url));
+    // Validate RTSP URL format
+    if !params.rtsp_url.starts_with("rtsp://") && !params.rtsp_url.starts_with("rtsps://") {
+        let error_html = format!(r#"<!DOCTYPE html>
+<html>
+<head><title>Error</title></head>
+<body style="font-family: Arial; padding: 20px; background: #1a1a1a; color: #fff;">
+<h1>❌ Invalid RTSP URL</h1>
+<p>The provided URL '{}' is invalid.</p>
+<p>RTSP URLs must start with 'rtsp://' or 'rtsps://'.</p>
+<p><strong>Make sure to properly URL-encode the rtsp_url parameter.</strong></p>
+<h3>Example:</h3>
+<code style="background: #333; padding: 10px; display: block;">
+/player?rtsp_url=rtsp%3A%2F%2Fadmin%3Apassword%40192.168.1.100%3A554%2Fstream&speed=1.0
+</code>
+</body>
+</html>"#, params.rtsp_url);
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(error_html))
+            .unwrap();
+    }
+    
+    let speed = params.speed.unwrap_or(1.0).max(0.5).min(4.0);
+    let mut hls_url = format!("/stream/hls?rtsp_url={}", urlencoding::encode(&params.rtsp_url));
+    if (speed - 1.0).abs() > 0.01 {
+        hls_url.push_str(&format!("&speed={}", speed));
+    }
+    
+    // Add warning for fast-forward mode without audio
+    let audio_warning = if speed >= 2.0 {
+        "<div style=\"margin-top: 10px; padding: 10px; background: #ff9800; color: #000; border-radius: 4px;\">
+        ⚡ Fast-forward mode: Audio disabled for faster processing</div>"
+    } else {
+        ""
+    };
     let html = format!(r#"<!DOCTYPE html>
 <html>
 <head>
@@ -1227,6 +1348,35 @@ async fn player_page(Query(params): Query<DirectStreamQuery>) -> Response {
             border-radius: 4px;
             font-size: 12px;
         }}
+        .controls {{
+            margin-top: 15px;
+            padding: 15px;
+            background: #2a2a2a;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            justify-content: center;
+        }}
+        .controls button {{
+            padding: 8px 16px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }}
+        .controls button:hover {{
+            background: #45a049;
+        }}
+        .controls button.active {{
+            background: #2196F3;
+        }}
+        .speed-label {{
+            font-weight: bold;
+            color: #4CAF50;
+        }}
     </style>
 </head>
 <body>
@@ -1235,10 +1385,21 @@ async fn player_page(Query(params): Query<DirectStreamQuery>) -> Response {
         <div class="video-wrapper">
             <video id="player" controls autoplay width="800" height="600"></video>
         </div>
+        <div class="controls">
+            <span>Playback Speed:</span>
+            <button onclick="changeSpeed(0.5)">0.5x</button>
+            <button onclick="changeSpeed(1.0)" class="active" id="btn-1">1.0x</button>
+            <button onclick="changeSpeed(1.5)" id="btn-1.5">1.5x</button>
+            <button onclick="changeSpeed(2.0)" id="btn-2">2.0x</button>
+            <button onclick="changeSpeed(3.0)" id="btn-3">3.0x</button>
+            <button onclick="changeSpeed(4.0)" id="btn-4">4.0x</button>
+            <span class="speed-label" id="current-speed">(Current: {}x)</span>
+        </div>
         <div class="info">
             <strong>Stream URL:</strong><br>
             <code>{}</code>
             <div class="status" id="status">Loading...</div>
+            {}
         </div>
     </div>
     <script>
@@ -1261,11 +1422,32 @@ async fn player_page(Query(params): Query<DirectStreamQuery>) -> Response {
                 statusDiv.innerHTML = '❌ Stream error: ' + data.response?.statusText || data.details;
             }}
         }});
+        
+        // Speed control
+        function changeSpeed(speed) {{
+            const rtspUrl = encodeURIComponent('{}');
+            const newUrl = `/player?rtsp_url=${{rtspUrl}}&speed=${{speed}}`;
+            window.location.href = newUrl;
+        }}
+        
+        // Highlight active speed button
+        const currentSpeed = {};
+        document.querySelectorAll('.controls button').forEach(btn => {{
+            btn.classList.remove('active');
+        }});
+        const activeBtn = document.getElementById(`btn-${{currentSpeed}}`);
+        if (activeBtn) {{
+            activeBtn.classList.add('active');
+        }}
     </script>
 </body>
 </html>"#, 
+        speed,
         params.rtsp_url,
-        hls_url
+        hls_url,
+        audio_warning,
+        params.rtsp_url,
+        speed
     );
 
     Response::builder()
