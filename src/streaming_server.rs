@@ -582,7 +582,7 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
         ffmpeg_args.extend_from_slice(&[
             "-f".to_string(), "hls".to_string(),
             "-hls_time".to_string(), "2".to_string(),
-            "-hls_list_size".to_string(), "5".to_string(),
+            "-hls_list_size".to_string(), "10".to_string(),
             "-hls_flags".to_string(), "delete_segments+independent_segments".to_string(),
             "-hls_segment_filename".to_string(), segment_pattern.clone(),
             "-hls_base_url".to_string(), base_url.clone(),
@@ -669,7 +669,7 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
     // Poll for playlist existence (up to ~10s for faster startup), then redirect to it
     let playlist_rel_url = format!("/stream/hls/{}/playlist.m3u8", id);
     let mut ready = false;
-    for _ in 0..40 {  // Reduced from 80 to 40 (10 seconds instead of 20)
+    for _ in 0..40 {  // 10 seconds with larger buffer for smoother playback
         if let Ok(meta) = std::fs::metadata(&playlist_path) {
             if meta.len() > 0 {
                 ready = true;
@@ -1080,7 +1080,7 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
                 "-i", &rtsp_url_clone,
                 "-f", "hls",
                 "-hls_time", "2",
-                "-hls_list_size", "5",
+                "-hls_list_size", "10",
                 "-hls_flags", "delete_segments+independent_segments",
                 "-hls_segment_filename", &segment_pattern,
                 "-hls_base_url", &base_url,
@@ -1152,10 +1152,10 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
         }
     });
 
-    // Poll for playlist existence (up to ~20s), then redirect to it
+    // Poll for playlist existence (up to ~10s), then redirect to it
     let playlist_rel_url = format!("/proxyhl/segment/{}/playlist.m3u8", id);
     let mut ready = false;
-    for _ in 0..80 {
+    for _ in 0..40 {  // 10 seconds with larger buffer for smoother playback
         if let Ok(meta) = std::fs::metadata(&playlist_path) {
             if meta.len() > 0 {
                 ready = true;
