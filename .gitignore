@@ -16,3 +16,69 @@ Thumbs.db
 
 # Logs
 *.log
+
+
+# Build outputs
+bin/
+obj/
+publish/
+build/
+Test/
+
+# Auto-generated files — do not commit
+Shared/Branding.cs
+
+# Visual Studio
+*.user
+*.suo
+.vs/
+
+# Rider IDE
+.idea/
+
+# Environment-specific settings
+appsettings.Production.json
+appsettings.Development.json
+
+# Native AOT publish artifacts
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Rust / Cargo
+target/
+**/*.rs.bk
+*.orig
+
+
+# Dear ImGui — only keep files needed for compilation
+imgui.ini
+third_party/imgui/backends/
+third_party/imgui/docs/
+third_party/imgui/examples/
+third_party/imgui/misc/
+third_party/imgui/imgui_demo.cpp
+third_party/imgui/.editorconfig
+third_party/imgui/.gitattributes
+third_party/imgui/.gitignore
+
+TestNotes.txt
+
+.wix/
+
+/build/
+# /builder/wix/config-writer.exe
+/builder/wix/logo_app_main.ico
+/builder/config-writer/target/
+test.json
+glpi_inventory.json
+ntsm_inventory.json
+
+dashboard.html
+
+TestFlow.txt
