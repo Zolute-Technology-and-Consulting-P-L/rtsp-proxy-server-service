@@ -2,15 +2,15 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::io::AsyncBufReadExt;  // for read_line
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use log::{error, info};
 
 pub struct RtspClient {
     rtsp_url: String,
-    ffmpeg_process: Option<Child>,
+    ffmpeg_process: Option<tokio::process::Child>,
     data_sender: Option<mpsc::UnboundedSender<Bytes>>,
     data_receiver: Arc<Mutex<Option<mpsc::UnboundedReceiver<Bytes>>>>,
 }
@@ -34,8 +34,7 @@ impl RtspClient {
         *self.data_receiver.lock().await = Some(rx);
 
         // Start FFmpeg process to convert RTSP to MPEG-TS
-        // FFmpeg command: ffmpeg -i rtsp://... -f mpegts -codec:v libx264 -preset ultrafast -tune zerolatency -b:v 2000k -codec:a aac pipe:1
-        let mut child = Command::new("ffmpeg")
+        let mut child = crate::ffmpeg_command()
             .args(&[
                 "-rtsp_transport", "tcp",
                 "-i", &self.rtsp_url,
@@ -51,7 +50,7 @@ impl RtspClient {
                 "-",
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())           // capture stderr
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| anyhow!("Failed to start FFmpeg. Make sure FFmpeg is installed and in PATH: {}", e))?;
@@ -60,6 +59,30 @@ impl RtspClient {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("Failed to capture FFmpeg stdout"))?;
+
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("Failed to capture FFmpeg stderr"))?;
+
+        // Spawn a task to read FFmpeg stderr line by line and log it
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        error!("[ffmpeg] {}", line.trim());
+                        line.clear();
+                    }
+                    Err(e) => {
+                        error!("[ffmpeg] stderr read error: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
 
         // Spawn a task to read from FFmpeg stdout and send to channel
         let sender = tx.clone();
@@ -76,7 +99,7 @@ impl RtspClient {
                     Ok(n) => {
                         let data = Bytes::copy_from_slice(&buffer[..n]);
                         if sender.send(data).is_err() {
-                            warn!("Failed to send data to channel, receiver dropped");
+                            error!("Failed to send data to channel, receiver dropped");
                             break;
                         }
                     }

@@ -13,17 +13,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
 use tokio::sync::RwLock;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use log::{error, info};
 use uuid::Uuid;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde_json::Value;
 use reqwest::Client;
+use tokio::io::AsyncBufReadExt;
 
 use crate::stream_manager::StreamManager;
 
@@ -102,6 +102,23 @@ struct ChannelListResponse {
     channels: Vec<ChannelInfo>,
 }
 
+// --- Client-side (browser) logging ---
+#[derive(Deserialize)]
+struct ClientLogRequest {
+    level: String,
+    message: String,
+}
+
+async fn client_log(Json(payload): Json<ClientLogRequest>) -> impl IntoResponse {
+    match payload.level.to_lowercase().as_str() {
+        "error" => error!("[browser] {}", payload.message),
+        "warn" => log::warn!("[browser] {}", payload.message),
+        "debug" => log::debug!("[browser] {}", payload.message),
+        _ => info!("[browser] {}", payload.message),
+    }
+    StatusCode::OK
+}
+
 impl StreamingServer {
     pub fn new(host: String, port: u16, stream_manager: Arc<RwLock<StreamManager>>) -> Self {
         Self {
@@ -130,12 +147,13 @@ impl StreamingServer {
             .route("/proxyhl/rtsp", get(proxy_hls_rtsp))
             .route("/proxyhl/sessions", get(list_proxyhl_sessions))
             .route("/proxyhl/segment/:id/:file", get(proxy_hls_segment))
+            .route("/api/client-log", post(client_log))
             .layer(CorsLayer::permissive())
             .with_state(self.stream_manager);
 
         let addr = format!("{}:{}", self.host, self.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        
+
         info!("Server listening on http://{}", addr);
         info!("API endpoints:");
         info!("  GET /player?rtsp_url=<url> - Play stream in browser");
@@ -147,11 +165,33 @@ impl StreamingServer {
         info!("  GET /stream/:id/hls/playlist.m3u8 - Get HLS playlist");
         info!("  GET /proxyhl/rtsp - HLS playlist from Hikvision RTSP");
         info!("  GET /proxyhl/sessions - List active HLS sessions");
+        info!("  POST /api/client-log - Browser console logs forwarded here");
 
         axum::serve(listener, app).await?;
 
         Ok(())
     }
+}
+
+/// Spawn a task that reads FFmpeg's stderr line by line and logs it
+fn log_ffmpeg_stderr(stderr: tokio::process::ChildStderr) {
+    tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    error!("[ffmpeg] {}", line.trim());
+                    line.clear();
+                }
+                Err(e) => {
+                    error!("[ffmpeg] stderr read error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
 }
 
 async fn root_handler() -> impl IntoResponse {
@@ -174,7 +214,8 @@ async fn root_handler() -> impl IntoResponse {
             "proxy_hls_rtsp": "GET /proxyhl/rtsp?ip=<ip>&channel=<ch> - Create HLS session from Hikvision",
             "proxyhl_playlist": "GET /proxyhl/segment/{id}/playlist.m3u8 - Get HLS playlist (Hikvision)",
             "proxyhl_segment": "GET /proxyhl/segment/{id}/{file} - Get HLS segment (Hikvision)",
-            "proxyhl_sessions": "GET /proxyhl/sessions - List all active HLS sessions (both endpoints)"
+            "proxyhl_sessions": "GET /proxyhl/sessions - List all active HLS sessions (both endpoints)",
+            "client_log": "POST /api/client-log - Forward browser console logs to server log file"
         },
         "examples": {
             "browser_hls": "http://localhost:8080/player?rtsp_url=rtsp://user:pass@camera-ip:554/stream",
@@ -192,19 +233,18 @@ async fn list_streams(
 ) -> impl IntoResponse {
     let manager = manager.read().await;
     let streams = manager.list_streams();
-    
+
     Json(StreamListResponse { streams })
 }
 
 async fn start_stream(
     Path(id): Path<String>,
-    maybe_query: Option<Query<StartStreamRequest>>, 
+    maybe_query: Option<Query<StartStreamRequest>>,
     State(manager): State<Arc<RwLock<StreamManager>>>,
     body: String,
 ) -> impl IntoResponse {
     info!("Received request to start stream {}", id);
 
-    // Prefer query param if present, fallback to urlencoded form body
     let rtsp_url = if let Some(Query(params)) = maybe_query {
         params.rtsp_url
     } else {
@@ -309,7 +349,6 @@ async fn stream_mpegts(
         }
     };
 
-    // Get data receiver from the client
     let client = stream_info.client.read().await;
     let receiver = match client.get_data_receiver().await {
         Some(rx) => rx,
@@ -323,7 +362,6 @@ async fn stream_mpegts(
     drop(client);
     drop(manager);
 
-    // Create streaming response
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(receiver)
         .map(|chunk| Ok::<_, std::io::Error>(chunk));
     let body = Body::from_stream(stream);
@@ -348,7 +386,6 @@ async fn stream_hls_playlist(
         return (StatusCode::NOT_FOUND, "Stream not found").into_response();
     }
 
-    // Generate a simple HLS playlist
     let playlist = format!(
         "#EXTM3U\n\
          #EXT-X-VERSION:3\n\
@@ -372,9 +409,6 @@ async fn stream_hls_segment(
     State(manager): State<Arc<RwLock<StreamManager>>>,
 ) -> Response {
     info!("HLS segment {} requested for stream {}", segment, id);
-    
-    // For simplicity, redirect to MPEG-TS stream
-    // In production, you'd want proper HLS segmentation
     stream_mpegts(Path(id), State(manager)).await
 }
 
@@ -388,11 +422,6 @@ struct DirectStreamQuery {
 async fn direct_stream(
     Query(params): Query<DirectStreamQuery>,
 ) -> Response {
-    use std::process::Stdio;
-    use tokio::process::Command;
-    use tokio::io::AsyncReadExt;
-    
-    // Validate RTSP URL format
     if !params.rtsp_url.starts_with("rtsp://") && !params.rtsp_url.starts_with("rtsps://") {
         error!("Invalid RTSP URL format: {}", params.rtsp_url);
         return (
@@ -405,11 +434,10 @@ async fn direct_stream(
         )
             .into_response();
     }
-    
+
     info!("Direct stream requested for {}", params.rtsp_url);
 
-    // Start FFmpeg process directly
-    let mut child = match Command::new("ffmpeg")
+    let mut child = match crate::ffmpeg_command()
         .args(&[
             "-rtsp_transport", "tcp",
             "-i", &params.rtsp_url,
@@ -421,7 +449,7 @@ async fn direct_stream(
             "-",
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
     {
@@ -435,21 +463,14 @@ async fn direct_stream(
         }
     };
 
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to capture FFmpeg stdout",
-            ).into_response();
-        }
-    };
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    log_ffmpeg_stderr(stderr);
 
-    // Create async stream from FFmpeg stdout
     let stream = async_stream::stream! {
         let mut reader = tokio::io::BufReader::new(stdout);
-        let mut buffer = vec![0u8; 188 * 7]; // MPEG-TS packets are 188 bytes
-        
+        let mut buffer = vec![0u8; 188 * 7];
+
         loop {
             match reader.read(&mut buffer).await {
                 Ok(0) => {
@@ -479,48 +500,42 @@ async fn direct_stream(
 }
 
 async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response {
-    let speed = params.speed.unwrap_or(1.0).max(0.5).min(4.0); // Clamp between 0.5x and 4x
-    
-    // Validate RTSP URL format
+
+    info!("HLS handler entered - URL: {}", params.rtsp_url);
+    let speed = params.speed.unwrap_or(1.0).max(0.5).min(4.0);
+
     if !params.rtsp_url.starts_with("rtsp://") && !params.rtsp_url.starts_with("rtsps://") {
         error!("Invalid RTSP URL format: {}", params.rtsp_url);
         return (
             StatusCode::BAD_REQUEST,
-            format!(
-                "Invalid RTSP URL: '{}'. URL must start with 'rtsp://' or 'rtsps://'. \
-                 Make sure to properly URL-encode the rtsp_url parameter. \
-                 Example: /stream/hls?rtsp_url=rtsp%3A%2F%2Fuser%3Apass%40camera%3A554%2Fstream&speed=2.0",
-                params.rtsp_url
-            ),
+            format!("Invalid RTSP URL: '{}' ...", params.rtsp_url),
         )
             .into_response();
     }
-    
+
     info!("Direct HLS stream requested for {} at {}x speed", params.rtsp_url, speed);
     if speed >= 2.0 {
         info!("Fast-forward mode: audio will be dropped for faster processing");
     }
 
-    // Create a temporary directory for HLS segments
     let id = Uuid::new_v4().to_string();
-    let tmp_dir = format!("/tmp/hls-stream-{}", id);
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("hls-stream-{}", id))
+        .to_string_lossy()
+        .to_string();
     let playlist_path = format!("{}/playlist.m3u8", tmp_dir);
     let segment_pattern = format!("{}/segment%03d.ts", tmp_dir);
     let base_url = format!("/stream/hls/{}/", id);
 
     if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
         error!("Failed to create temp directory: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to create temp directory: {}", e),
-        )
-            .into_response();
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create temp directory: {}", e)).into_response();
     }
 
     let playlist_path_clone = playlist_path.clone();
     let rtsp_url_clone = params.rtsp_url.clone();
 
-    // Create shutdown channel and register session
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     {
         let mut map = HLS_SESSIONS.write().await;
@@ -535,50 +550,31 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
         );
     }
 
-    // Spawn FFmpeg in background to generate HLS segments
     let id_clone_for_ffmpeg = id.clone();
     let tmp_dir_for_ffmpeg = tmp_dir.clone();
     let sessions_for_ffmpeg = HLS_SESSIONS.clone();
     tokio::spawn(async move {
-        // Build FFmpeg args with speed control optimizations
         let mut ffmpeg_args: Vec<String> = vec![
             "-rtsp_transport".to_string(), "tcp".to_string(),
         ];
-
-        // For speeds > 1.0, read input faster (helps with recorded streams)
         if speed > 1.0 {
             ffmpeg_args.extend_from_slice(&[
                 "-readrate".to_string(), speed.to_string(),
             ]);
         }
-
         ffmpeg_args.extend_from_slice(&[
             "-i".to_string(), rtsp_url_clone.clone(),
         ]);
-
-        // Add video filter for speed control
         if (speed - 1.0).abs() > 0.01 {
             let video_filter = format!("setpts=PTS/{}", speed);
-            ffmpeg_args.extend_from_slice(&[
-                "-vf".to_string(), video_filter,
-            ]);
-
-            // For fast-forward, drop audio or use simple tempo
+            ffmpeg_args.extend_from_slice(&["-vf".to_string(), video_filter]);
             if speed >= 2.0 {
-                // Drop audio for speeds >= 2x (much faster processing)
-                ffmpeg_args.extend_from_slice(&[
-                    "-an".to_string(),
-                ]);
+                ffmpeg_args.extend_from_slice(&["-an".to_string()]);
             } else {
-                // Audio tempo filter for moderate speeds
                 let audio_filter = format!("atempo={}", speed);
-                ffmpeg_args.extend_from_slice(&[
-                    "-af".to_string(), audio_filter,
-                ]);
+                ffmpeg_args.extend_from_slice(&["-af".to_string(), audio_filter]);
             }
         }
-
-        // Add HLS output settings with optimizations
         ffmpeg_args.extend_from_slice(&[
             "-f".to_string(), "hls".to_string(),
             "-hls_time".to_string(), "2".to_string(),
@@ -587,48 +583,46 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
             "-hls_segment_filename".to_string(), segment_pattern.clone(),
             "-hls_base_url".to_string(), base_url.clone(),
             "-codec:v".to_string(), "libx264".to_string(),
-            "-preset".to_string(), "veryfast".to_string(), // Faster than ultrafast for speed processing
+            "-preset".to_string(), "veryfast".to_string(),
             "-tune".to_string(), "zerolatency".to_string(),
-            "-profile:v".to_string(), "baseline".to_string(), // Simpler profile, faster encoding
+            "-profile:v".to_string(), "baseline".to_string(),
             "-g".to_string(), "50".to_string(),
             "-keyint_min".to_string(), "25".to_string(),
             "-sc_threshold".to_string(), "0".to_string(),
-            "-b:v".to_string(), "1000k".to_string(), // Lower bitrate for faster encoding
-            "-threads".to_string(), "0".to_string(), // Use all CPU threads
+            "-b:v".to_string(), "1000k".to_string(),
+            "-threads".to_string(), "0".to_string(),
         ]);
-
-        // Only add audio codec if we're not dropping audio
         if speed < 2.0 {
             ffmpeg_args.extend_from_slice(&[
                 "-codec:a".to_string(), "aac".to_string(),
                 "-ar".to_string(), "44100".to_string(),
-                "-b:a".to_string(), "96k".to_string(), // Lower audio bitrate
+                "-b:a".to_string(), "96k".to_string(),
             ]);
         }
-
         ffmpeg_args.push(playlist_path_clone.clone());
 
-        let mut child = match Command::new("ffmpeg")
+        info!("HLS session {}: starting FFmpeg, segments -> {}", id_clone_for_ffmpeg, segment_pattern);
+        let mut child = match crate::ffmpeg_command()
             .args(&ffmpeg_args)
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
         {
             Ok(child) => child,
             Err(e) => {
                 error!("Failed to start FFmpeg for HLS: {}", e);
-                // Remove session if we failed to start
                 let mut map = sessions_for_ffmpeg.write().await;
                 map.remove(&id_clone_for_ffmpeg);
                 return;
             }
         };
+        let stderr = child.stderr.take().unwrap();
+        log_ffmpeg_stderr(stderr);
 
-        // Wait for shutdown or process exit
         tokio::select! {
             _ = shutdown_rx.recv() => {
-                info!("Shutting down HLS session {} due to inactivity or explicit stop", id_clone_for_ffmpeg);
+                info!("Shutting down HLS session {}", id_clone_for_ffmpeg);
                 let _ = child.kill().await;
             }
             _ = child.wait() => {
@@ -640,7 +634,6 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
         map.remove(&id_clone_for_ffmpeg);
     });
 
-    // Spawn inactivity monitor
     let id_for_monitor = id.clone();
     let sessions_for_monitor = HLS_SESSIONS.clone();
     tokio::spawn(async move {
@@ -651,7 +644,6 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
                 if let Some(sess) = map.get(&id_for_monitor) {
                     sess.last_access.elapsed() > HLS_IDLE_TIMEOUT
                 } else {
-                    // Session already gone
                     false
                 }
             };
@@ -666,10 +658,9 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
         }
     });
 
-    // Poll for playlist existence (up to ~10s for faster startup), then redirect to it
     let playlist_rel_url = format!("/stream/hls/{}/playlist.m3u8", id);
     let mut ready = false;
-    for _ in 0..40 {  // 10 seconds with larger buffer for smoother playback
+    for _ in 0..40 {
         if let Ok(meta) = std::fs::metadata(&playlist_path) {
             if meta.len() > 0 {
                 ready = true;
@@ -688,7 +679,7 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
             .into_response();
     }
 
-    // Update last access
+    info!("HLS session {}: playlist ready at {}", id, playlist_path);
     {
         let mut map = HLS_SESSIONS.write().await;
         if let Some(sess) = map.get_mut(&id) {
@@ -704,9 +695,12 @@ async fn stream_hls_direct(Query(params): Query<DirectStreamQuery>) -> Response 
 }
 
 async fn stream_hls_session_playlist(Path(id): Path<String>) -> Response {
-    let path = format!("/tmp/hls-stream-{}/playlist.m3u8", id);
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("hls-stream-{}", id))
+        .to_string_lossy()
+        .to_string();
+    let path = format!("{}/playlist.m3u8", tmp_dir);
 
-    // Update session last access
     {
         let mut map = HLS_SESSIONS.write().await;
         if let Some(sess) = map.get_mut(&id) {
@@ -735,7 +729,6 @@ async fn stream_hls_session_playlist(Path(id): Path<String>) -> Response {
 }
 
 async fn stream_hls_session_segment(Path((id, file)): Path<(String, String)>) -> Response {
-    // Prevent path traversal
     if file.contains("..") || file.contains('/') || file.contains('\\') {
         return (
             StatusCode::BAD_REQUEST,
@@ -744,7 +737,6 @@ async fn stream_hls_session_segment(Path((id, file)): Path<(String, String)>) ->
             .into_response();
     }
 
-    // Update session last access
     {
         let mut map = HLS_SESSIONS.write().await;
         if let Some(sess) = map.get_mut(&id) {
@@ -752,11 +744,14 @@ async fn stream_hls_session_segment(Path((id, file)): Path<(String, String)>) ->
         }
     }
 
-    let path = format!("/tmp/hls-stream-{}/{}", id, file);
+    let path = std::env::temp_dir()
+        .join(format!("hls-stream-{}", id))
+        .join(&file)
+        .to_string_lossy()
+        .to_string();
 
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
-            // Basic content-type guess
             let ctype = if file.ends_with(".ts") {
                 "video/mp2t"
             } else if file.ends_with(".m3u8") {
@@ -846,7 +841,6 @@ async fn proxy_cameras(Query(params): Query<ProxyCamerasQuery>) -> Response {
         }
     };
 
-    // Try JSON first
     if let Ok(value) = serde_json::from_str::<Value>(&body) {
         return (
             StatusCode::OK,
@@ -855,7 +849,6 @@ async fn proxy_cameras(Query(params): Query<ProxyCamerasQuery>) -> Response {
             .into_response();
     }
 
-    // Fallback: parse XML for channel list
     let channels = parse_channels_xml(&body);
     let response = ChannelListResponse { channels };
 
@@ -919,7 +912,6 @@ fn parse_channels_xml(xml: &str) -> Vec<ChannelInfo> {
         }
         buf.clear();
     }
-
     channels
 }
 
@@ -928,9 +920,8 @@ async fn proxy_rtsp(Query(params): Query<ProxyRtspQuery>) -> Response {
     let username = params.username.unwrap_or_else(|| "admin".to_string());
     let password = params.password.unwrap_or_default();
     let channel = params.channel.unwrap_or_else(|| "1".to_string());
-    let stream_number = params.stream_number.unwrap_or_else(|| "1".to_string()); // 1=main (01), 2=sub (02), etc.
+    let stream_number = params.stream_number.unwrap_or_else(|| "1".to_string());
 
-    // Hikvision convention: channels/{channel}{stream:02d}
     let suffix = format!("{}{:02}", channel, stream_number.parse::<u32>().unwrap_or(1));
 
     let encoded_user = urlencoding::encode(&username);
@@ -942,7 +933,7 @@ async fn proxy_rtsp(Query(params): Query<ProxyRtspQuery>) -> Response {
 
     info!("Proxying RTSP channel {} from {}", channel, params.ip);
 
-    let mut child = match Command::new("ffmpeg")
+    let mut child = match crate::ffmpeg_command()
         .args(&[
             "-rtsp_transport", "tcp",
             "-i", &rtsp_url,
@@ -953,7 +944,7 @@ async fn proxy_rtsp(Query(params): Query<ProxyRtspQuery>) -> Response {
             "pipe:1",
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
     {
@@ -968,16 +959,9 @@ async fn proxy_rtsp(Query(params): Query<ProxyRtspQuery>) -> Response {
         }
     };
 
-    let stdout = match child.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to capture FFmpeg stdout",
-            )
-                .into_response();
-        }
-    };
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    log_ffmpeg_stderr(stderr);
 
     let stream = async_stream::stream! {
         let mut child = child;
@@ -1003,7 +987,6 @@ async fn proxy_rtsp(Query(params): Query<ProxyRtspQuery>) -> Response {
         let _ = child.wait().await;
     };
 
-    // Ensure ffmpeg terminates when client disconnects
     let body = Body::from_stream(stream);
 
     Response::builder()
@@ -1019,7 +1002,6 @@ async fn proxy_rtsp(Query(params): Query<ProxyRtspQuery>) -> Response {
 async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
     info!("Direct HLS stream requested for Hikvision channel");
 
-    // Build RTSP URL similar to proxy_rtsp
     let port = params.port.unwrap_or_else(|| "554".to_string());
     let username = params.username.unwrap_or_else(|| "admin".to_string());
     let password = params.password.unwrap_or_default();
@@ -1035,9 +1017,11 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
         encoded_user, encoded_pass, params.ip, port, suffix
     );
 
-    // Create a temporary directory for HLS segments
     let id = Uuid::new_v4().to_string();
-    let tmp_dir = format!("/tmp/hls-proxyhl-{}", id);
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("hls-proxyhl-{}", id))
+        .to_string_lossy()
+        .to_string();
     let playlist_path = format!("{}/playlist.m3u8", tmp_dir);
     let segment_pattern = format!("{}/segment%03d.ts", tmp_dir);
     let base_url = format!("/proxyhl/segment/{}/", id);
@@ -1054,7 +1038,6 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
     let playlist_path_clone = playlist_path.clone();
     let rtsp_url_clone = rtsp_url.clone();
 
-    // Create shutdown channel and register session
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     {
         let mut map = HLS_SESSIONS.write().await;
@@ -1069,12 +1052,11 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
         );
     }
 
-    // Spawn FFmpeg in background to generate HLS segments
     let id_clone_for_ffmpeg = id.clone();
     let tmp_dir_for_ffmpeg = tmp_dir.clone();
     let sessions_for_ffmpeg = HLS_SESSIONS.clone();
     tokio::spawn(async move {
-        let mut child = match Command::new("ffmpeg")
+        let mut child = match crate::ffmpeg_command()
             .args(&[
                 "-rtsp_transport", "tcp",
                 "-i", &rtsp_url_clone,
@@ -1097,21 +1079,21 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
                 &playlist_path_clone,
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
         {
             Ok(child) => child,
             Err(e) => {
                 error!("Failed to start FFmpeg for HLS: {}", e);
-                // Remove session if we failed to start
                 let mut map = sessions_for_ffmpeg.write().await;
                 map.remove(&id_clone_for_ffmpeg);
                 return;
             }
         };
+        let stderr = child.stderr.take().unwrap();
+        log_ffmpeg_stderr(stderr);
 
-        // Wait for shutdown or process exit
         tokio::select! {
             _ = shutdown_rx.recv() => {
                 info!("Shutting down HLS session {} due to inactivity or explicit stop", id_clone_for_ffmpeg);
@@ -1126,7 +1108,6 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
         map.remove(&id_clone_for_ffmpeg);
     });
 
-    // Spawn inactivity monitor
     let id_for_monitor = id.clone();
     let sessions_for_monitor = HLS_SESSIONS.clone();
     tokio::spawn(async move {
@@ -1137,7 +1118,6 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
                 if let Some(sess) = map.get(&id_for_monitor) {
                     sess.last_access.elapsed() > HLS_IDLE_TIMEOUT
                 } else {
-                    // Session already gone
                     false
                 }
             };
@@ -1152,10 +1132,9 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
         }
     });
 
-    // Poll for playlist existence (up to ~10s), then redirect to it
     let playlist_rel_url = format!("/proxyhl/segment/{}/playlist.m3u8", id);
     let mut ready = false;
-    for _ in 0..40 {  // 10 seconds with larger buffer for smoother playback
+    for _ in 0..40 {
         if let Ok(meta) = std::fs::metadata(&playlist_path) {
             if meta.len() > 0 {
                 ready = true;
@@ -1174,7 +1153,6 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
             .into_response();
     }
 
-    // Update last access
     {
         let mut map = HLS_SESSIONS.write().await;
         if let Some(sess) = map.get_mut(&id) {
@@ -1190,7 +1168,6 @@ async fn proxy_hls_rtsp(Query(params): Query<ProxyHlsRtspQuery>) -> Response {
 }
 
 async fn proxy_hls_segment(Path((id, file)): Path<(String, String)>) -> Response {
-    // Prevent path traversal
     if file.contains("..") || file.contains('/') || file.contains('\\') {
         return (
             StatusCode::BAD_REQUEST,
@@ -1199,7 +1176,6 @@ async fn proxy_hls_segment(Path((id, file)): Path<(String, String)>) -> Response
             .into_response();
     }
 
-    // Update session last access
     {
         let mut map = HLS_SESSIONS.write().await;
         if let Some(sess) = map.get_mut(&id) {
@@ -1207,11 +1183,14 @@ async fn proxy_hls_segment(Path((id, file)): Path<(String, String)>) -> Response
         }
     }
 
-    let path = format!("/tmp/hls-proxyhl-{}/{}", id, file);
+    let path = std::env::temp_dir()
+        .join(format!("hls-proxyhl-{}", id))
+        .join(&file)
+        .to_string_lossy()
+        .to_string();
 
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
-            // Basic content-type guess
             let ctype = if file.ends_with(".ts") {
                 "video/mp2t"
             } else if file.ends_with(".m3u8") {
@@ -1260,20 +1239,18 @@ async fn list_proxyhl_sessions() -> impl IntoResponse {
             last_access_secs: sess.last_access.elapsed().as_secs(),
         });
     }
-    // Sort by most recently accessed first
     sessions.sort_by_key(|s| std::cmp::Reverse(s.last_access_secs));
     Json(HlsSessionsListResponse { sessions })
 }
 
 async fn player_page(Query(params): Query<DirectStreamQuery>) -> Response {
-    // Validate RTSP URL format
     if !params.rtsp_url.starts_with("rtsp://") && !params.rtsp_url.starts_with("rtsps://") {
         let error_html = format!(r#"<!DOCTYPE html>
 <html>
 <head><title>Error</title></head>
 <body style="font-family: Arial; padding: 20px; background: #1a1a1a; color: #fff;">
 <h1>❌ Invalid RTSP URL</h1>
-<p>The provided URL '{}' is invalid.</p>
+<p>The provided URL '{rtsp_url}' is invalid.</p>
 <p>RTSP URLs must start with 'rtsp://' or 'rtsps://'.</p>
 <p><strong>Make sure to properly URL-encode the rtsp_url parameter.</strong></p>
 <h3>Example:</h3>
@@ -1281,27 +1258,30 @@ async fn player_page(Query(params): Query<DirectStreamQuery>) -> Response {
 /player?rtsp_url=rtsp%3A%2F%2Fadmin%3Apassword%40192.168.1.100%3A554%2Fstream&speed=1.0
 </code>
 </body>
-</html>"#, params.rtsp_url);
+</html>"#, rtsp_url = params.rtsp_url);
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .body(Body::from(error_html))
             .unwrap();
     }
-    
+
     let speed = params.speed.unwrap_or(1.0).max(0.5).min(4.0);
     let mut hls_url = format!("/stream/hls?rtsp_url={}", urlencoding::encode(&params.rtsp_url));
     if (speed - 1.0).abs() > 0.01 {
         hls_url.push_str(&format!("&speed={}", speed));
     }
-    
-    // Add warning for fast-forward mode without audio
+
     let audio_warning = if speed >= 2.0 {
-        "<div style=\"margin-top: 10px; padding: 10px; background: #ff9800; color: #000; border-radius: 4px;\">
+        "<div style=\"margin-top: 10px; padding: 10px; background: #ff9800; color: #000; border-radius: 4px;\">\
         ⚡ Fast-forward mode: Audio disabled for faster processing</div>"
     } else {
         ""
     };
+
+    let rtsp_url_js = params.rtsp_url.replace('\\', "\\\\").replace('\'', "\\'");
+    let hls_url_js = hls_url.replace('\\', "\\\\").replace('\'', "\\'");
+
     let html = format!(r#"<!DOCTYPE html>
 <html>
 <head>
@@ -1393,61 +1373,101 @@ async fn player_page(Query(params): Query<DirectStreamQuery>) -> Response {
             <button onclick="changeSpeed(2.0)" id="btn-2">2.0x</button>
             <button onclick="changeSpeed(3.0)" id="btn-3">3.0x</button>
             <button onclick="changeSpeed(4.0)" id="btn-4">4.0x</button>
-            <span class="speed-label" id="current-speed">(Current: {}x)</span>
+            <span class="speed-label" id="current-speed">(Current: {speed}x)</span>
         </div>
         <div class="info">
             <strong>Stream URL:</strong><br>
-            <code>{}</code>
+            <code>{rtsp_url}</code>
             <div class="status" id="status">Loading...</div>
-            {}
+            {audio_warning}
         </div>
     </div>
     <script>
+        function logToServer(level, message) {{
+            fetch('/api/client-log', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{level: level, message: message}})
+            }}).catch(function() {{}});
+        }}
+
+        ['log', 'warn', 'error'].forEach(function(fn) {{
+            const original = console[fn];
+            console[fn] = function() {{
+                original.apply(console, arguments);
+                const args = Array.prototype.slice.call(arguments);
+                const msg = args.map(function(a) {{
+                    return (typeof a === 'object') ? JSON.stringify(a) : String(a);
+                }}).join(' ');
+                logToServer(fn === 'log' ? 'info' : fn, msg);
+            }};
+        }});
+
+        window.addEventListener('error', function(e) {{
+            logToServer('error', 'window.onerror: ' + e.message + ' at ' + e.filename + ':' + e.lineno);
+        }});
+
+        logToServer('info', 'Player page loaded. Hls defined: ' + (typeof Hls !== 'undefined'));
+
         const videoElement = document.getElementById('player');
         const statusDiv = document.getElementById('status');
-        const hls = new Hls();
-        
-        hls.loadSource('{}');
-        hls.attachMedia(videoElement);
-        
-        hls.on(Hls.Events.MANIFEST_PARSED, function() {{
-            statusDiv.innerHTML = '✅ Stream loaded successfully. Playing...';
-            videoElement.play().catch(e => {{
-                statusDiv.innerHTML = '⚠️ Autoplay blocked: ' + e.message;
+        const hlsSourceUrl = '{hls_url_js}';
+
+        logToServer('info', 'HLS source URL resolved to: ' + hlsSourceUrl);
+
+        if (typeof Hls === 'undefined') {{
+            logToServer('error', 'Hls.js did not load from CDN');
+            statusDiv.innerHTML = '❌ hls.js failed to load';
+        }} else if (!Hls.isSupported()) {{
+            logToServer('error', 'Hls.isSupported() returned false in this browser');
+            statusDiv.innerHTML = '❌ HLS not supported in this browser';
+        }} else {{
+            logToServer('info', 'Creating Hls instance and calling loadSource');
+            const hls = new Hls();
+
+            hls.loadSource(hlsSourceUrl);
+            hls.attachMedia(videoElement);
+
+            hls.on(Hls.Events.MANIFEST_PARSED, function() {{
+                logToServer('info', 'MANIFEST_PARSED event fired');
+                statusDiv.innerHTML = '✅ Stream loaded successfully. Playing...';
+                videoElement.play().catch(function(e) {{
+                    logToServer('warn', 'Autoplay blocked: ' + e.message);
+                    statusDiv.innerHTML = '⚠️ Autoplay blocked: ' + e.message;
+                }});
             }});
-        }});
-        
-        hls.on(Hls.Events.ERROR, function(event, data) {{
-            if (data.fatal) {{
-                statusDiv.innerHTML = '❌ Stream error: ' + data.response?.statusText || data.details;
-            }}
-        }});
-        
-        // Speed control
+
+            hls.on(Hls.Events.ERROR, function(event, data) {{
+                logToServer('error', 'HLS.js error: ' + JSON.stringify(data));
+                if (data.fatal) {{
+                    statusDiv.innerHTML = '❌ Stream error: ' + (data.details || 'unknown');
+                }}
+            }});
+        }}
+
         function changeSpeed(speed) {{
-            const rtspUrl = encodeURIComponent('{}');
-            const newUrl = `/player?rtsp_url=${{rtspUrl}}&speed=${{speed}}`;
+            const rtspUrl = encodeURIComponent('{rtsp_url_js}');
+            const newUrl = '/player?rtsp_url=' + rtspUrl + '&speed=' + speed;
+            logToServer('info', 'Changing speed to ' + speed + ', navigating to ' + newUrl);
             window.location.href = newUrl;
         }}
-        
-        // Highlight active speed button
-        const currentSpeed = {};
-        document.querySelectorAll('.controls button').forEach(btn => {{
+
+        const currentSpeed = {speed};
+        document.querySelectorAll('.controls button').forEach(function(btn) {{
             btn.classList.remove('active');
         }});
-        const activeBtn = document.getElementById(`btn-${{currentSpeed}}`);
+        const activeBtn = document.getElementById('btn-' + currentSpeed);
         if (activeBtn) {{
             activeBtn.classList.add('active');
         }}
     </script>
 </body>
-</html>"#, 
-        speed,
-        params.rtsp_url,
-        hls_url,
-        audio_warning,
-        params.rtsp_url,
-        speed
+</html>"#,
+        speed = speed,
+        rtsp_url = params.rtsp_url,
+        audio_warning = audio_warning,
+        hls_url_js = hls_url_js,
+        rtsp_url_js = rtsp_url_js
     );
 
     Response::builder()

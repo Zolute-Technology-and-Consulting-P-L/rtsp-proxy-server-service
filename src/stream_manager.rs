@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
+use log::{error, info};
 
 use crate::rtsp_client::RtspClient;
 
